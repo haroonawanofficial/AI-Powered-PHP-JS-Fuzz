@@ -1,8 +1,8 @@
-# PHP-Probe
+# Advance phpinjection scan
 
 ## Overview
 
-PHP-Probe is a powerful web application security testing tool that specializes in scanning for PHP injection vulnerabilities and evaluating PHP stream wrapper issues. It provides thorough vulnerability testing, reporting, and analysis for enhanced web application security.
+This script is designed to scan a specified domain for PHP vulnerabilities automatically with obfuscation and accuracy.
 
 ## Features
 
@@ -23,7 +23,7 @@ PHP-Probe is a powerful web application security testing tool that specializes i
 
 ## Test Cases
 
-PHP-Probe includes a variety of test cases that assess web application security. These test cases help identify vulnerabilities and weaknesses in your application, ensuring that it remains robust and secure.
+Advance phpinjection scan includes a variety of test cases that assess web application security. These test cases help identify vulnerabilities and weaknesses in your application, ensuring that it remains robust and secure.
 
 - **PHP Injection Test Cases:** Scanning for PHP injection vulnerabilities with different markers and patterns.
 - **Stream Wrapper Test Cases:** Evaluating the handling of PHP stream wrappers in various scenarios.
@@ -44,4 +44,4 @@ Test cases are essential because they provide structured scenarios for evaluatin
 
 ---
 
-**Disclaimer:** PHP-Probe is a testing tool and should be used responsibly. Use it in authorized environment.
+**Disclaimer:** Advance phpinjection scan is a testing tool and should be used responsibly. Use it in authorized environment.

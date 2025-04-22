@@ -65,7 +65,7 @@ playwright install chromium
 python super_fuzz.py           # enter target URL when prompted
 ```
 
- ##  Compare it with all Kali XSS/PHP/JS Tools
+## Comparison with Kali XSS, PHP, and JS Tools
 
 | Feature / Tool                    | AI_PHP_JS_Fuzzer v5.5                                                                                                                                     | XSStrike                                                   | DalFox                                                          | XSSer                                          |
 |-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|----------------------------------------------------------------|------------------------------------------------|
@@ -82,3 +82,9 @@ python super_fuzz.py           # enter target URL when prompted
 | **Ease of Use**                   | One big monolithic script—with many flags (`--autohook`, `--debug`, etc.)                                                                               | Simple CLI: `xsstrike -u URL [--crawl] [--headless]`         | Simple CLI: `dalfox url URL [--crawl] [--script]`              | Simple CLI: `xsser -u URL [options]`            |
 | **Installation**                  | `pip install playwright bs4` + `playwright install --with-deps`                                                                                        | `pip install xsstrike` + `npm install -g puppeteer`         | `go install github.com/hahwul/dalfox/v2@latest`                | `pip install XSSer`                            |
 | **Legal / Risk Considerations**   | Very aggressive: multi‑protocol, smuggling—use only on authorized targets                                                                               | Primarily safe reflected XSS testing                        | Safe reflected XSS with headless support                        | Basic reflected/stored XSS; low‑risk            |
+
+
+
+### How `--autohook` Improves Injection & Fuzzing
+
+By driving a real Chrome instance (with your profile, extensions, network and DNS settings) instead of a synthetic headless context, `--autohook` ensures that **every** dynamic route, XHR call, Shadow‑DOM insertion and client‑side rendering step is executed exactly as it would be in production. This means your injection and fuzzing payloads are submitted to the **true** runtime environment—capturing race conditions, one‑time tokens, lazy‑loaded forms and WebSocket endpoints that a simple HTTP crawler or proxy would miss. As a result, you achieve far higher coverage and accuracy: you’ll uncover hidden injection points (DOM XSS, GraphQL parameters, real‑time WebSocket channels) and avoid false negatives in modern SPAs that rely heavily on client‑side logic.

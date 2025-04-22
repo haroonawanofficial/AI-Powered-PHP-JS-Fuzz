@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════
-                      P H P  •  S U P E R  •  F U Z Z E R
+                   P H P  •  J S • S U P E R  •  F U Z Z E R
                                  ( v5 )
-                            Haroon Ahmad Awan
+                          Haroon Ahmad Awan
 ═══════════════════════════════════════════════════════════════════════════
 • Dynamic SPA crawler (Angular / React / Vue / Lit / Next / Svelte / HTMX)
 • Discovers:

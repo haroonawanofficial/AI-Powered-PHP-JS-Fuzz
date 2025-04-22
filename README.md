@@ -65,6 +65,8 @@ playwright install chromium
 python super_fuzz.py           # enter target URL when prompted
 ```
 
+ ##  Compare it with all Kali XSS/PHP/JS Tools
+
 | Feature / Tool                    | AI_PHP_JS_Fuzzer v5.5                                                                                                                                     | XSStrike                                                   | DalFox                                                          | XSSer                                          |
 |-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|----------------------------------------------------------------|------------------------------------------------|
 | **Language**                      | Python + Playwright                                                                                                                                    | Python                                                     | Go (single binary)                                             | Python                                         |

@@ -1,5 +1,5 @@
 # AI-PHP-JS-Fuzzer v5 
-_Auto‑crawler & exploit‑launcher for modern web stacks (Angular / React / Vue, classic PHP, REST/GraphQL, Web‑Sockets)._
+_Auto‑crawler & fuzzer for modern web stacks (Angular / React / Vue, classic PHP, REST/GraphQL, Web‑Sockets)._
 
 ---
 

@@ -16,6 +16,9 @@ _Auto‑crawler & exploit‑launcher for modern web stacks (Angular / React /
 - **Auto‑Form Fuzzer**  
   ➜ Mutates every discovered field with AI‑style obfuscated payloads (`whoami`, `<svg…>`, `gopher://…`) and submits via the form’s real method.
 
+- **Auto‑Hook**  
+  ➜ This will help you to mutate as if your browsing the webpage, bypassing completely any waf on the spot, they blocks user agents, etc
+
 - **Server‑Side Attack Arsenal**
   - Multi‑stage **param recursion** (`?x=http://…?y=whoami`)
   - Protocol/scheme abuse – `gopher://`, `file://`, `data://`, `blob:`  

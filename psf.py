@@ -50,19 +50,58 @@ def log(msg, tag="*"):
         fp.write(line + "\n")
 
 # ── Playwright helper ──────────────────────────────────────────────────
+# ── Playwright helper (replace old open_page) ───────────────────────────
 def open_page(p, url, timeout=PAGE_TIMEOUT, retries=RETRIES):
     for attempt in range(retries + 1):
         try:
-            br = p.chromium.launch(headless=True, args=["--disable-web-security"])
-            ctx = br.new_context(ignore_https_errors=True)
-            pg  = ctx.new_page()
-            pg.goto(url, timeout=timeout)
+            br = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-web-security",
+                    "--disable-blink-features=AutomationControlled",  # stealth
+                ],
+            )
+            ctx = br.new_context(
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+            )
+            ctx.set_default_navigation_timeout(timeout)
+            pg = ctx.new_page()
+            pg.goto(url, wait_until="domcontentloaded")  # faster success condition
             return br, ctx, pg
         except Exception as e:
             log(f"Playwright fail ({attempt+1}/{retries+1}) – {url} – {e}", "!")
             with contextlib.suppress(Exception):
                 br.close()
+
+    # Fallback: grab raw HTML with Requests so we can **still** harvest forms/links
+    try:
+        r = requests.get(url, timeout=10, verify=False)
+        if r.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "html.parser")
+            dummy = type("Dummy", (), {})()        # minimal dummy objects
+            dummy.close = lambda: None
+            dummy_evaluate = lambda js: []
+            return dummy, None, type(
+                "DummyPage",
+                (),
+                {
+                    "query_selector_all": soup.select,
+                    "evaluate": lambda _: [],
+                    "on": lambda *a, **k: None,
+                },
+            )()
+    except Exception:
+        pass
+
     return None, None, None
+
 
 # ── AI‑style payload mutator ───────────────────────────────────────────
 def ai_mutate(payload):
@@ -99,15 +138,17 @@ def fuzz_html_form(action, method, fields):
 def smart_crawl(seed, p, max_depth=2, same_origin=True):
     origin = "{0.scheme}://{0.netloc}".format(urlparse(seed))
     discovered, endpoints = {seed}, set()
+    failed = set()                      #  ← NEW
     queue = deque([(seed, 0)])
 
     while queue:
         current, depth = queue.popleft()
-        if depth > max_depth:
+        if depth > max_depth or current in failed:
             continue
 
         br, ctx, page = open_page(p, current)
         if not page:
+            failed.add(current)         #  ← NEW
             continue
 
         # gather XHR / fetch / WS
